@@ -21,6 +21,8 @@ from collections import *
 from optparse import OptionParser
 import random
 import string
+import numpy as np
+
 
 ##########################################################################
 def garbage_collect_greedy(self):
@@ -37,6 +39,7 @@ def garbage_collect_greedy(self):
     Remove the below "pass" statement.
     """
     pass
+
 ###########################################################################
 
 # to make Python2 and Python3 act the same -- how dumb
@@ -53,6 +56,17 @@ def random_randint(low, hi):
 def random_choice(L):
     return L[random_randint(0, len(L)-1)]
 
+class BLPages:
+    def __init__(self, idx):
+        self.block_idx = idx
+        self.block_live_pages = 0
+    def add_live_page(self):
+        self.block_live_pages += 1
+    def minus_live_page(self):
+        assert self.block_live_pages > 0
+        self.block_live_pages -= 1
+    def reset_block(self):
+        self.block_live_pages=0
 
 class ssd:
     def __init__(self, ssd_type, num_logical_pages, num_blocks, pages_per_block,
@@ -87,6 +101,13 @@ class ssd:
         self.STATE_INVALID = 1
         self.STATE_ERASED = 2
         self.STATE_VALID = 3
+
+        if self.ssd_type == self.TYPE_LOGGING:
+            #@@TH : Block State
+            self.BLOCK_STATE_INVALID = 1
+            self.BLOCK_STATE_ERASED = 2
+            self.BLOCK_STATE_PROGRAMMED = 3
+
         
         self.num_pages = self.num_blocks * self.pages_per_block
         self.state = {}
@@ -122,6 +143,13 @@ class ssd:
         self.live_count = {}
         for i in range(self.num_blocks):
             self.live_count[i] = 0
+        # @@TH : Liva page counts in each block & its status
+        if self.ssd_type == self.TYPE_LOGGING:
+            self.block_status=np.ones(self.num_blocks)  # Initiate them as self.STATE_INVALID
+            self.live_page_count = np.empty(shape=self.num_blocks, dtype=BLPages)
+            for i in range(self.num_blocks):
+                self.live_page_count[i]=BLPages(i)
+                self.live_page_count[i].block_live_pages = i
 
         # FTL
         self.forward_map = {}
@@ -171,7 +199,6 @@ class ssd:
 
         # now, definitely NOT in use
         self.gc_used_blocks[block_address] = 0
-
         # STATS
         self.physical_erase_count[block_address] += 1
         self.physical_erase_sum += 1
@@ -180,8 +207,9 @@ class ssd:
     def physical_program(self, page_address, data):
         self.data[page_address] = data
         self.state[page_address] = self.STATE_VALID
+        block_address = int(page_address / self.pages_per_block)
         # STATS
-        self.physical_write_count[int(page_address / self.pages_per_block)] += 1
+        self.physical_write_count[block_address] += 1
         self.physical_write_sum += 1
         return 
 
@@ -227,11 +255,15 @@ class ssd:
         if self.state[first_page] == self.STATE_INVALID or self.state[first_page] == self.STATE_ERASED:
             if self.state[first_page] == self.STATE_INVALID:
                 self.physical_erase(block)
+                #@@TH It is always log-structured FTL when use this function
+                self.block_status[block] = self.BLOCK_STATE_ERASED
+                self.live_page_count[block].reset_block()
             self.current_block = block
             self.current_page = first_page
             self.gc_used_blocks[block] = 1
             return True
         return False
+
 
     def get_cursor(self):
         if self.current_page == -1:
@@ -257,8 +289,17 @@ class ssd:
         # NORMAL MODE writing
         assert(self.state[self.current_page] == self.STATE_ERASED)
         self.physical_program(self.current_page, data)
+        #@@TH : Discount Live Page Count
+        prev_PBA = self.forward_map[page_address]
+        if prev_PBA != -1:
+            prev_block = int( self.forward_map[page_address] / self.pages_per_block)
+            self.live_page_count[prev_block].minus_live_page()
         self.forward_map[page_address] = self.current_page
         self.reverse_map[self.current_page] = page_address
+        #@@TH : set block status as Programmed & It is always Log-Structured FTL
+        block_address = int(self.current_page / self.pages_per_block)
+        self.block_status[block_address] = self.BLOCK_STATE_PROGRAMMED
+        self.live_page_count[block_address].add_live_page()
         self.update_cursor()
         return 'success'
 
@@ -318,6 +359,54 @@ class ssd:
         # END: block iteration
         return
 
+    def garbage_collect_greedy(self):
+        victim_list = sorted(self.live_page_count[self.block_status == self.BLOCK_STATE_PROGRAMMED],key=lambda x: x.block_live_pages, reverse=False)
+        blocks_cleaned = 0
+        for i in victim_list:
+            block = i.block_idx
+            if block == self.current_block:
+                continue
+            if i.block_live_pages == self.pages_per_block:
+                self.gc_count += 1
+                return
+            # page to start looking for live blocks
+            page_start = block * self.pages_per_block
+            # collect list of live physical pages in this block
+            live_pages = []
+            for page in range(page_start, page_start + self.pages_per_block):
+                logical_page = self.reverse_map[page]
+                if logical_page != -1 and self.forward_map[logical_page] == page:
+                    live_pages.append(page)
+            # if ONLY live blocks, don't clean it! (why bother with move?)
+            # live pages should be copied to current writing location
+            for page in live_pages:
+                # live: so copy it someplace new
+                if self.gc_trace:
+                    print('gc %d:: read(physical_page=%d)' % (self.gc_count, page))
+                    print('gc %d:: write()' % self.gc_count)
+                data = self.physical_read(page)
+                self.write(self.reverse_map[page], data)
+
+            # finally, erase the block and see if we're done
+            blocks_cleaned += 1
+            self.physical_erase(block)
+            self.block_status[block] = self.BLOCK_STATE_ERASED
+            self.live_page_count[block].reset_block()
+
+            if self.gc_trace:
+                print('gc %d:: erase(block=%d)' % (self.gc_count, block))
+                if self.show_state:
+                    print('')
+                    self.dump()
+                    print('')
+
+            if self.blocks_in_use() <= self.gc_low_water_mark:
+                # done! record where we stopped and return
+                self.gc_count += 1
+                return
+        # END: block iteration
+        return
+
     def upkeep(self):
         # (help): DO NOT MODIFY THIS CODE BLOCK !!!
         # GARBAGE COLLECTION
@@ -337,6 +426,9 @@ class ssd:
         if self.forward_map[address] == -1:
             self.logical_trim_fail_sum += 1
             return 'fail: uninitialized trim'
+        if self.ssd_type == self.TYPE_LOGGING:
+            block_address = int(address / self.pages_per_block)
+            self.live_page_count[block_address].minus_live_page()
         self.forward_map[address] = -1
         return 'success'
 
